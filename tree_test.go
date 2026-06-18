@@ -5,15 +5,18 @@ import (
 	"fmt"
 	"math/big"
 	"net"
+	"net/netip"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
-	"github.com/maxmind/mmdbwriter/inserter"
-	"github.com/maxmind/mmdbwriter/mmdbtype"
-	"github.com/oschwald/maxminddb-golang"
+	"github.com/oschwald/maxminddb-golang/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/maxmind/mmdbwriter/inserter"
+	"github.com/maxmind/mmdbwriter/mmdbtype"
 )
 
 type testInsert struct {
@@ -101,13 +104,43 @@ func TestTreeInsertAndGet(t *testing.T) {
 		},
 		"double":      42.123456,
 		"float":       float32(1.1),
-		"int32":       -268435456,
+		"int32":       int32(-268435456),
 		"map":         allTypesLookupSubmap,
 		"uint128":     &bigInt,
 		"uint16":      uint64(0x64),
 		"uint32":      uint64(0x10000000),
 		"uint64":      uint64(0x1000000000000000),
 		"utf8_string": "unicode! ☯ - ♫",
+	}
+
+	stringsGetRecord := mmdbtype.Map{
+		// firstSize
+		"size28": mmdbtype.String(strings.Repeat("*", 28)),
+		"size29": mmdbtype.String(strings.Repeat("*", 29)),
+		"size30": mmdbtype.String(strings.Repeat("*", 30)),
+		// secondSize
+		"size284": mmdbtype.String(strings.Repeat("*", 284)),
+		"size285": mmdbtype.String(strings.Repeat("*", 285)),
+		"size286": mmdbtype.String(strings.Repeat("*", 286)),
+		// thirdSize
+		"size65820": mmdbtype.String(strings.Repeat("*", 65820)),
+		"size65821": mmdbtype.String(strings.Repeat("*", 65821)),
+		"size65822": mmdbtype.String(strings.Repeat("*", 65822)),
+		// maxSize
+		"maxSizeMinus1": mmdbtype.String(strings.Repeat("*", 16843036)),
+	}
+
+	var stringsLookupRecord any = map[string]any{
+		"size28":        strings.Repeat("*", 28),
+		"size29":        strings.Repeat("*", 29),
+		"size30":        strings.Repeat("*", 30),
+		"size284":       strings.Repeat("*", 284),
+		"size285":       strings.Repeat("*", 285),
+		"size286":       strings.Repeat("*", 286),
+		"size65820":     strings.Repeat("*", 65820),
+		"size65821":     strings.Repeat("*", 65821),
+		"size65822":     strings.Repeat("*", 65822),
+		"maxSizeMinus1": strings.Repeat("*", 16843036),
 	}
 
 	tests := []struct {
@@ -310,19 +343,19 @@ func TestTreeInsertAndGet(t *testing.T) {
 					network:          "10.0.0.0/8",
 					start:            "10.0.0.0",
 					end:              "10.255.255.255",
-					expectedErrorMsg: "attempt to insert ::a00:0/104, which is in a reserved network",
+					expectedErrorMsg: "attempt to insert 10.0.0.0/8 into 10.0.0.0/8, which is a reserved network",
 				},
 				{
 					network:          "10.0.0.1/32",
 					start:            "10.0.0.1",
 					end:              "10.0.0.1",
-					expectedErrorMsg: "attempt to insert ::a00:1/128, which is in a reserved network",
+					expectedErrorMsg: "attempt to insert 10.0.0.1/32 into 10.0.0.0/8, which is a reserved network",
 				},
 				{
 					network:          "2002:100::/24",
 					start:            "2002:100::",
 					end:              "2002:1ff:ffff:ffff:ffff:ffff:ffff:ffff",
-					expectedErrorMsg: "attempt to insert 2002:100::/24, which is in an aliased network",
+					expectedErrorMsg: "attempt to insert 2002:100::/24 into 2002::/16, which is an aliased network",
 				},
 			},
 			gets: []testGet{
@@ -380,13 +413,15 @@ func TestTreeInsertAndGet(t *testing.T) {
 			expectedNodeCount: 368,
 		},
 		{
-			name: "node pruning",
+			name: "node pruning - adjacent",
 			inserts: []testInsert{
 				{
 					network: "1.1.0.0/24",
 					start:   "1.1.0.0",
 					end:     "1.1.0.255",
-					value:   mmdbtype.Map{"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}}},
+					value: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
 				},
 				{
 					network: "1.1.1.0/24",
@@ -394,14 +429,18 @@ func TestTreeInsertAndGet(t *testing.T) {
 					end:     "1.1.1.255",
 					// We intentionally don't use the same variable for
 					// here and above as we want them to be different instances.
-					value: mmdbtype.Map{"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}}},
+					value: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
 				},
 			},
 			gets: []testGet{
 				{
-					ip:               "1.1.0.0",
-					expectedNetwork:  "1.1.0.0/23",
-					expectedGetValue: mmdbtype.Map{"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}}},
+					ip:              "1.1.0.0",
+					expectedNetwork: "1.1.0.0/23",
+					expectedGetValue: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
 					expectedLookupValue: func() *any {
 						v := any(map[string]any{"a": []any{uint64(1), []byte{1, 2}}})
 						return &v
@@ -409,6 +448,88 @@ func TestTreeInsertAndGet(t *testing.T) {
 				},
 			},
 			expectedNodeCount: 366,
+		},
+		{
+			name: "node pruning - inserting smaller duplicate into larger",
+			inserts: []testInsert{
+				{
+					network: "1.1.0.0/24",
+					start:   "1.1.0.0",
+					end:     "1.1.0.255",
+					value: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
+				},
+				{
+					network: "1.1.0.128/26",
+					start:   "1.1.0.128",
+					end:     "1.1.0.191",
+					// We intentionally don't use the same variable for
+					// here and above as we want them to be different instances.
+					value: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
+				},
+			},
+			gets: []testGet{
+				{
+					ip:              "1.1.0.0",
+					expectedNetwork: "1.1.0.0/24",
+					expectedGetValue: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
+					expectedLookupValue: func() *any {
+						v := any(map[string]any{"a": []any{uint64(1), []byte{1, 2}}})
+						return &v
+					}(),
+				},
+			},
+			expectedNodeCount: 367,
+		},
+		{
+			name: "node pruning - inserting smaller non-duplicate and then duplicate into larger",
+			inserts: []testInsert{
+				{
+					network: "1.1.0.0/24",
+					start:   "1.1.0.0",
+					end:     "1.1.0.255",
+					value: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
+				},
+				{
+					network: "1.1.0.128/26",
+					start:   "1.1.0.128",
+					end:     "1.1.0.191",
+					// We intentionally don't use the same variable for
+					// here and above as we want them to be different instances.
+					value: mmdbtype.Map{"a": mmdbtype.Int32(1)},
+				},
+				{
+					network: "1.1.0.128/26",
+					start:   "1.1.0.128",
+					end:     "1.1.0.191",
+					// We intentionally don't use the same variable for
+					// here and above as we want them to be different instances.
+					value: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
+				},
+			},
+			gets: []testGet{
+				{
+					ip:              "1.1.0.0",
+					expectedNetwork: "1.1.0.0/24",
+					expectedGetValue: mmdbtype.Map{
+						"a": mmdbtype.Slice{mmdbtype.Uint64(1), mmdbtype.Bytes{1, 2}},
+					},
+					expectedLookupValue: func() *any {
+						v := any(map[string]any{"a": []any{uint64(1), []byte{1, 2}}})
+						return &v
+					}(),
+				},
+			},
+			expectedNodeCount: 367,
 		},
 		{
 			name:       "insertion of range with multiple subnets",
@@ -466,16 +587,36 @@ func TestTreeInsertAndGet(t *testing.T) {
 			},
 			expectedNodeCount: 375,
 		},
+		{
+			name: "insertion of strings at boundary control byte size",
+			inserts: []testInsert{
+				{
+					network: "1.1.1.1/32",
+					start:   "1.1.1.1",
+					end:     "1.1.1.1",
+					value:   stringsGetRecord,
+				},
+			},
+			gets: []testGet{
+				{
+					ip:                  "1.1.1.1",
+					expectedNetwork:     "1.1.1.1/32",
+					expectedGetValue:    stringsGetRecord,
+					expectedLookupValue: &stringsLookupRecord,
+				},
+			},
+			expectedNodeCount: 375,
+		},
 	}
 
 	for _, recordSize := range []int{24, 28, 32} {
 		t.Run(fmt.Sprintf("Record Size: %d", recordSize), func(t *testing.T) {
 			for _, test := range tests {
 				t.Run(test.name, func(t *testing.T) {
-					epoch := time.Now().Unix()
+					epochSec := time.Now().Unix()
 					tree, err := New(
 						Options{
-							BuildEpoch:              epoch,
+							BuildEpoch:              epochSec,
 							DatabaseType:            "mmdbwriter-test",
 							Description:             map[string]string{"en": "Test database"},
 							DisableIPv4Aliasing:     test.disableIPv4Aliasing,
@@ -484,47 +625,61 @@ func TestTreeInsertAndGet(t *testing.T) {
 						},
 					)
 					require.NoError(t, err)
-					if test.insertType == "" || test.insertType == "net" {
+					switch test.insertType {
+					case "", "net":
 						for _, insert := range test.inserts {
+							//nolint:forbidigo // code predates netip
 							_, network, err := net.ParseCIDR(insert.network)
 							require.NoError(t, err)
 
 							require.NoError(t, tree.Insert(network, insert.value))
 						}
 						for _, insert := range test.insertErrors {
+							//nolint:forbidigo // code predates netip
 							_, network, err := net.ParseCIDR(insert.network)
 							require.NoError(t, err)
 
 							err = tree.Insert(network, insert.value)
 
-							assert.EqualError(t, err, insert.expectedErrorMsg)
+							require.EqualError(t, err, insert.expectedErrorMsg)
 						}
-					} else if test.insertType == "" || test.insertType == "range" {
+					case "range":
 						for _, insert := range test.inserts {
+							//nolint:forbidigo // code predates netip
 							start := net.ParseIP(insert.start)
 							require.NotNil(t, start)
+							//nolint:forbidigo // code predates netip
 							end := net.ParseIP(insert.end)
 							require.NotNil(t, end)
 
 							require.NoError(t, tree.InsertRange(start, end, insert.value))
 						}
 						for _, insert := range test.insertErrors {
+							//nolint:forbidigo // code predates netip
 							start := net.ParseIP(insert.start)
 							require.NotNil(t, start)
+							//nolint:forbidigo // code predates netip
 							end := net.ParseIP(insert.end)
 							require.NotNil(t, end)
 
 							err = tree.InsertRange(start, end, insert.value)
-							assert.EqualError(t, err, insert.expectedErrorMsg)
+							require.EqualError(t, err, insert.expectedErrorMsg)
 						}
 					}
 
 					tree.finalize()
 
 					for _, get := range test.gets {
+						//nolint:forbidigo // code predates netip
 						network, value := tree.Get(net.ParseIP(get.ip))
 
-						assert.Equal(t, get.expectedNetwork, network.String(), "network for %s", get.ip)
+						assert.Equal(
+							t,
+							get.expectedNetwork,
+							network.String(),
+							"network for %s",
+							get.ip,
+						)
 						assert.Equal(t, get.expectedGetValue, value, "value for %s", get.ip)
 					}
 
@@ -538,7 +693,7 @@ func TestTreeInsertAndGet(t *testing.T) {
 
 					assert.Equal(t, int64(buf.Len()), numBytes, "number of bytes")
 
-					f, err := os.CreateTemp("", "mmdbwriter")
+					f, err := os.CreateTemp(t.TempDir(), "mmdbwriter")
 					require.NoError(t, err)
 					defer func() { require.NoError(t, os.Remove(f.Name())) }()
 
@@ -551,7 +706,7 @@ func TestTreeInsertAndGet(t *testing.T) {
 					loadBuf := &bytes.Buffer{}
 					tree, err = Load(f.Name(),
 						Options{
-							BuildEpoch:              epoch,
+							BuildEpoch:              epochSec,
 							DisableIPv4Aliasing:     test.disableIPv4Aliasing,
 							IncludeReservedNetworks: test.includeReservedNetworks,
 						},
@@ -563,7 +718,12 @@ func TestTreeInsertAndGet(t *testing.T) {
 
 					checkMMDB(t, loadBuf, test.gets, "MMDB lookups on Load tree")
 
-					assert.Equal(t, bufBytes, loadBuf.Bytes(), "Load + WriteTo generates an identical database")
+					assert.Equal(
+						t,
+						bufBytes,
+						loadBuf.Bytes(),
+						"Load + WriteTo generates an identical database",
+					)
 				})
 			}
 		})
@@ -571,26 +731,36 @@ func TestTreeInsertAndGet(t *testing.T) {
 }
 
 func checkMMDB(t *testing.T, buf *bytes.Buffer, gets []testGet, name string) {
+	t.Helper()
+
 	t.Run(name, func(t *testing.T) {
-		reader, err := maxminddb.FromBytes(buf.Bytes())
+		reader, err := maxminddb.OpenBytes(buf.Bytes())
 		require.NoError(t, err)
 
 		defer reader.Close()
 
 		for _, get := range gets {
 			var v any
-			network, ok, err := reader.LookupNetwork(net.ParseIP(get.ip), &v)
+
+			res := reader.Lookup(netip.MustParseAddr(get.ip))
+			err := res.Decode(&v)
 			require.NoError(t, err)
 
-			assert.Equal(t, get.expectedNetwork, network.String(), "network for %s in database", get.ip)
+			assert.Equal(
+				t,
+				get.expectedNetwork,
+				res.Prefix().String(),
+				"network for %s in database",
+				get.ip,
+			)
 
 			if get.expectedLookupValue == nil {
-				assert.False(t, ok, "%s is not in the database", get.ip)
+				assert.False(t, res.Found(), "%s is not in the database", get.ip)
 			} else {
 				assert.Equal(t, *get.expectedLookupValue, v, "value for %s in database", get.ip)
 			}
 		}
-		assert.NoError(t, reader.Verify(), "verify database format")
+		require.NoError(t, reader.Verify(), "verify database format")
 	})
 }
 
@@ -604,12 +774,14 @@ func TestInsertFunc_RemovalAndLaterInsert(t *testing.T) {
 	)
 	require.NoError(t, err)
 
+	//nolint:forbidigo // code predates netip
 	_, network, err := net.ParseCIDR("::1.1.1.0/120")
 	require.NoError(t, err)
 
 	value := mmdbtype.String("value")
 	require.NoError(t, tree.Insert(network, value))
 
+	//nolint:forbidigo // code predates netip
 	ip := net.ParseIP("::1.1.1.1")
 
 	recNetwork, recValue := tree.Get(ip)
@@ -617,6 +789,7 @@ func TestInsertFunc_RemovalAndLaterInsert(t *testing.T) {
 	assert.Equal(t, network, recNetwork)
 	assert.Equal(t, value, recValue)
 
+	//nolint:forbidigo // code predates netip
 	_, removedNetwork, err := net.ParseCIDR("::1.1.1.1/128")
 	require.NoError(t, err)
 
@@ -645,7 +818,28 @@ func TestInsertFunc_RemovalAndLaterInsert(t *testing.T) {
 	assert.Nil(t, recValue)
 }
 
-func s2ip(v string) *any { //nolint:gocritic // test
+// See GitHub #62.
+func TestGet_4ByteIPIn128BitTree(t *testing.T) {
+	writer, err := New(Options{DatabaseType: "GitHub #62"})
+	require.NoError(t, err)
+
+	//nolint:forbidigo // code predates netip
+	ip, network, err := net.ParseCIDR("1.0.0.0/24")
+	require.NoError(t, err)
+
+	err = writer.Insert(network, mmdbtype.Map{"country_code": mmdbtype.String("AU")})
+	require.NoError(t, err)
+
+	getNetwork, _ := writer.Get(ip.To4())
+
+	assert.Equal(t, network.String(), getNetwork.String(), "4-byte lookup")
+
+	getNetwork, _ = writer.Get(ip.To16())
+
+	assert.Equal(t, network.String(), getNetwork.String(), "16-byte lookup")
+}
+
+func s2ip(v string) *any {
 	i := any(v)
 	return &i
 }

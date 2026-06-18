@@ -3,9 +3,10 @@ package inserter
 import (
 	"testing"
 
-	"github.com/maxmind/mmdbwriter/mmdbtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/maxmind/mmdbwriter/mmdbtype"
 )
 
 func TestRemove(t *testing.T) {
@@ -83,7 +84,7 @@ func TestTopLevelMergeWith(t *testing.T) {
 	for _, test := range tests {
 		v, err := TopLevelMergeWith(test.new)(test.existing)
 		if test.expectedErr != "" {
-			assert.EqualError(t, err, test.expectedErr)
+			require.EqualError(t, err, test.expectedErr)
 		} else {
 			require.NoError(t, err)
 			assert.Equal(t, test.expected, v)
@@ -173,7 +174,7 @@ func TestDeepMergeWith(t *testing.T) {
 	for _, test := range tests {
 		v, err := DeepMergeWith(test.new)(test.existing)
 		if test.expectedErr != "" {
-			assert.EqualError(t, err, test.expectedErr)
+			require.EqualError(t, err, test.expectedErr)
 		} else {
 			require.NoError(t, err)
 			assert.Equal(t, test.expected, v)

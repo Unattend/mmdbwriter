@@ -71,36 +71,7 @@ func (r *record) insert(
 		if err != nil {
 			return err
 		}
-
-		// Check to see if the children are the same and can be merged.
-		child0 := r.node.children[0]
-		child1 := r.node.children[1]
-		if child0.recordType != child1.recordType {
-			return nil
-		}
-		switch child0.recordType {
-		// Nodes can't be merged
-		case recordTypeFixedNode,
-			recordTypeNode:
-			return nil
-		case recordTypeEmpty,
-			recordTypeReserved:
-			r.recordType = child0.recordType
-			r.node = nil
-			return nil
-		case recordTypeData:
-			if child0.value.key != child1.value.key {
-				return nil
-			}
-			// Children have same data and can be merged
-			r.recordType = recordTypeData
-			r.value = child0.value
-			iRec.dataMap.remove(child1.value)
-			r.node = nil
-			return nil
-		default:
-			return fmt.Errorf("merging record type %d is not implemented", child0.recordType)
-		}
+		return r.maybeMergeChildren(iRec)
 	case recordTypeFixedNode:
 		return r.node.insert(iRec, newDepth)
 	case recordTypeEmpty, recordTypeData:
@@ -123,6 +94,7 @@ func (r *record) insert(
 				} else if oldData == nil || !oldData.Equal(newData) {
 					iRec.dataMap.remove(r.value)
 					value, err := iRec.dataMap.store(newData)
+					//nolint:revive //preexisting
 					if err != nil {
 						return err
 					}
@@ -139,14 +111,14 @@ func (r *record) insert(
 		r.node = &node{children: [2]record{*r, *r}}
 		r.value = nil
 		r.recordType = recordTypeNode
-		return r.node.insert(iRec, newDepth)
+		err := r.node.insert(iRec, newDepth)
+		if err != nil {
+			return err
+		}
+		return r.maybeMergeChildren(iRec)
 	case recordTypeReserved:
 		if iRec.prefixLen >= newDepth {
-			return fmt.Errorf(
-				"attempt to insert %s/%d, which is in a reserved network",
-				iRec.ip,
-				iRec.prefixLen,
-			)
+			return newReservedNetworkError(iRec.ip, newDepth, iRec.prefixLen)
 		}
 		// If we are inserting a network that contains a reserved network,
 		// we silently remove the reserved network.
@@ -158,13 +130,42 @@ func (r *record) insert(
 			return nil
 		}
 		// attempting to insert _into_ an aliased network
-		return fmt.Errorf(
-			"attempt to insert %s/%d, which is in an aliased network",
-			iRec.ip,
-			iRec.prefixLen,
-		)
+		return newAliasedNetworkError(iRec.ip, newDepth, iRec.prefixLen)
 	default:
 		return fmt.Errorf("inserting into record type %d is not implemented", r.recordType)
+	}
+}
+
+func (r *record) maybeMergeChildren(iRec insertRecord) error {
+	// Check to see if the children are the same and can be merged.
+	// Use pointer access to avoid copying the record struct; this is
+	// called from every node-level insert, so the copies add up across
+	// millions of inserts.
+	child0 := &r.node.children[0]
+	child1 := &r.node.children[1]
+	if child0.recordType != child1.recordType {
+		return nil
+	}
+	switch child0.recordType {
+	// Nodes can't be merged
+	case recordTypeFixedNode, recordTypeNode:
+		return nil
+	case recordTypeEmpty, recordTypeReserved:
+		r.recordType = child0.recordType
+		r.node = nil
+		return nil
+	case recordTypeData:
+		if child0.value.key != child1.value.key {
+			return nil
+		}
+		// Children have same data and can be merged
+		r.recordType = recordTypeData
+		r.value = child0.value
+		iRec.dataMap.remove(child1.value)
+		r.node = nil
+		return nil
+	default:
+		return fmt.Errorf("merging record type %d is not implemented", child0.recordType)
 	}
 }
 
@@ -190,7 +191,7 @@ func (n *node) finalize(currentNum int) int {
 	n.nodeNum = currentNum
 	currentNum++
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		switch n.children[i].recordType {
 		case recordTypeFixedNode,
 			recordTypeNode:

@@ -7,13 +7,15 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net"
 	"time"
 
+	"github.com/oschwald/maxminddb-golang/v2"
+	"go4.org/netipx"
+
 	"github.com/maxmind/mmdbwriter/inserter"
 	"github.com/maxmind/mmdbwriter/mmdbtype"
-	"github.com/oschwald/maxminddb-golang"
-	"go4.org/netipx"
 )
 
 var (
@@ -78,6 +80,17 @@ type Options struct {
 	// to `inserter.ReplaceWith`, which replaces any conflicting old value
 	// entirely with the new.
 	Inserter inserter.FuncGenerator
+
+	// KeyGenerator is used to generate unique keys for the top-level record
+	// values inserted into the database. This is used to deduplicate data
+	// in memory as the tree is being created. The KeyGenerator must
+	// generate a unique key for the value. If two different values have
+	// the same key, only one will be used.
+	//
+	// The default key generator serializes the value and generates a
+	// SHA-256 hash from it. Although this is relatively safe, it can be
+	// resource intensive for large data structures.
+	KeyGenerator KeyGenerator
 }
 
 // Tree represents an MaxMind DB search tree.
@@ -95,13 +108,18 @@ type Tree struct {
 	// This is set when the tree is finalized
 	nodeCount       int
 	inserterFuncGen inserter.FuncGenerator
+
+	// insertScratchIP is reused across IPv4-to-IPv6 conversions in
+	// insert. Insert is not thread-safe (see the doc comments on
+	// Insert / InsertFunc), so a single per-Tree scratch suffices.
+	// The first 12 bytes stay zeroed to encode the v4Prefix.
+	insertScratchIP [16]byte
 }
 
 // New creates a new Tree.
 func New(opts Options) (*Tree, error) {
 	tree := &Tree{
 		buildEpoch:              time.Now().Unix(),
-		dataMap:                 newDataMap(),
 		databaseType:            opts.DatabaseType,
 		description:             map[string]string{},
 		disableMetadataPointers: opts.DisableMetadataPointers,
@@ -121,6 +139,12 @@ func New(opts Options) (*Tree, error) {
 
 	if opts.IPVersion != 0 {
 		tree.ipVersion = opts.IPVersion
+	}
+
+	if opts.KeyGenerator == nil {
+		tree.dataMap = newDataMap(newKeyWriter())
+	} else {
+		tree.dataMap = newDataMap(opts.KeyGenerator)
 	}
 
 	if opts.Languages != nil {
@@ -164,7 +188,7 @@ func New(opts Options) (*Tree, error) {
 func Load(path string, opts Options) (*Tree, error) {
 	db, err := maxminddb.Open(path)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("opening %s: %w", path, err)
 	}
 	defer db.Close()
 
@@ -178,6 +202,7 @@ func Load(path string, opts Options) (*Tree, error) {
 	}
 
 	if opts.IPVersion == 0 {
+		//nolint:gosec // IPVersion is always 4 or 6
 		opts.IPVersion = int(metadata.IPVersion)
 	}
 
@@ -186,6 +211,7 @@ func Load(path string, opts Options) (*Tree, error) {
 	}
 
 	if opts.RecordSize == 0 {
+		//nolint:gosec // RecordSize is always 24, 28, or 32
 		opts.RecordSize = int(metadata.RecordSize)
 	}
 
@@ -194,30 +220,24 @@ func Load(path string, opts Options) (*Tree, error) {
 		return nil, err
 	}
 
-	dser := newDeserializer()
+	unmarshaler := mmdbtype.NewUnmarshaler()
 
 	var networkOpts []maxminddb.NetworksOption
-	if opts.IPVersion == 6 && !opts.DisableIPv4Aliasing {
-		networkOpts = append(networkOpts, maxminddb.SkipAliasedNetworks)
+	if opts.IPVersion == 6 && opts.DisableIPv4Aliasing {
+		networkOpts = append(networkOpts, maxminddb.IncludeAliasedNetworks())
 	}
 
-	networks := db.Networks(networkOpts...)
-	for networks.Next() {
-		var network *net.IPNet
+	for res := range db.Networks(networkOpts...) {
+		unmarshaler.Clear()
+		err := res.Decode(unmarshaler)
+		if err != nil {
+			return nil, fmt.Errorf("unmarshaling record for network: %w", err)
+		}
 
-		dser.clear()
-		network, err = networks.Network(dser)
+		err = tree.Insert(netipx.PrefixIPNet(res.Prefix()), unmarshaler.Result())
 		if err != nil {
 			return nil, err
 		}
-
-		err = tree.Insert(network, dser.rv)
-		if err != nil {
-			return nil, err
-		}
-	}
-	if err := networks.Err(); err != nil {
-		return nil, err
 	}
 	return tree, nil
 }
@@ -265,7 +285,10 @@ func (t *Tree) insert(
 
 	ip := network.IP
 	if t.treeDepth == 128 && len(ip) == 4 {
-		ip = ipV4ToV6(ip)
+		// Reuse the per-Tree scratch slot. The first 12 bytes stay
+		// zeroed (the v4Prefix); only the last 4 bytes vary per call.
+		copy(t.insertScratchIP[12:], ip)
+		ip = t.insertScratchIP[:]
 		prefixLen += 96
 	}
 
@@ -339,6 +362,7 @@ func (t *Tree) insertStringNetwork(
 	inserterFunc inserter.Func,
 	node *node,
 ) error {
+	//nolint:forbidigo // code predates netip
 	_, ipnet, err := net.ParseCIDR(network)
 	if err != nil {
 		return fmt.Errorf("parsing network (%s): %w", network, err)
@@ -353,6 +377,7 @@ var ipv4AliasNetworks = []string{
 }
 
 func (t *Tree) insertIPv4Aliases() error {
+	//nolint:forbidigo // code predates netip
 	_, ipv4Root, err := net.ParseCIDR("::/96")
 	if err != nil {
 		return fmt.Errorf("parsing IPv4 root: %w", err)
@@ -406,17 +431,16 @@ func (t *Tree) Get(ip net.IP) (*net.IPNet, mmdbtype.DataType) {
 		// the MaxMind DB format has the record for 1.1.1.1 at ::1.1.1.1.
 		if ipv4 := ip.To4(); ipv4 != nil {
 			lookupIP = ipV4ToV6(ipv4)
+
+			// This simplifies the logic around creating the IPNet. If we didn't
+			// do this, we would need to specifically adjust the prefix length
+			// when creating the mask and we would also need to worry about
+			// what to do if there isn't an IPv4 tree.
+			ip = ip.To16()
 		}
 	}
 
 	prefixLen, r := t.root.get(lookupIP, 0)
-
-	// This is so that if you look up an IPv4 address in a database that has
-	// an IPv4 subtree, you will get back an IPv4 network. This matches what
-	// github.com/oschwald/maxminddb-golang does.
-	if prefixLen >= 96 && len(ip) == 4 {
-		prefixLen -= 96
-	}
 
 	mask := net.CIDRMask(prefixLen, t.treeDepth)
 
@@ -477,7 +501,7 @@ func (t *Tree) WriteTo(w io.Writer) (int64, error) {
 	nb64, err := dataWriter.WriteTo(buf)
 	numBytes += nb64
 	if err != nil {
-		return numBytes, err
+		return numBytes, fmt.Errorf("writing data to buffer: %w", err)
 	}
 
 	nb, err = buf.Write(metadataStartMarker)
@@ -503,7 +527,7 @@ func (t *Tree) WriteTo(w io.Writer) (int64, error) {
 		return numBytes, fmt.Errorf("flushing buffer to writer: %w", err)
 	}
 
-	return numBytes, err
+	return numBytes, nil
 }
 
 func (t *Tree) writeNode(
@@ -525,7 +549,7 @@ func (t *Tree) writeNode(
 		return nodesWritten, numBytes, fmt.Errorf("writing node: %w", err)
 	}
 
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		child := n.children[i]
 		if child.recordType != recordTypeNode && child.recordType != recordTypeFixedNode {
 			continue
@@ -594,7 +618,7 @@ func (t *Tree) copyNode(buf []byte, n *node, dataWriter *dataWriter) error {
 		buf[0] = byte((left >> 16) & 0xFF)
 		buf[1] = byte((left >> 8) & 0xFF)
 		buf[2] = byte(left & 0xFF)
-		buf[3] = byte((((left >> 24) & 0x0F) << 4) | (right >> 24 & 0x0F))
+		buf[3] = byte(((((left >> 24) & 0x0F) << 4) | (right >> 24 & 0x0F)) & 0xFF)
 		buf[4] = byte((right >> 16) & 0xFF)
 		buf[5] = byte((right >> 8) & 0xFF)
 		buf[6] = byte(right & 0xFF)
@@ -629,16 +653,26 @@ func (t *Tree) writeMetadata(dw *dataWriter) (int64, error) {
 	for _, v := range t.languages {
 		languages = append(languages, mmdbtype.String(v))
 	}
+	if t.nodeCount > math.MaxUint32 {
+		return 0, fmt.Errorf("node count of %d exceeds the maximum allowed value", t.nodeCount)
+	}
 	metadata := mmdbtype.Map{
 		"binary_format_major_version": mmdbtype.Uint16(2),
 		"binary_format_minor_version": mmdbtype.Uint16(0),
-		"build_epoch":                 mmdbtype.Uint64(t.buildEpoch),
-		"database_type":               mmdbtype.String(t.databaseType),
-		"description":                 description,
-		"ip_version":                  mmdbtype.Uint16(t.ipVersion),
-		"languages":                   languages,
-		"node_count":                  mmdbtype.Uint32(t.nodeCount),
-		"record_size":                 mmdbtype.Uint16(t.recordSize),
+
+		// Although it might make sense to change the type on this, there is no use
+		// case where someone would reasonably pass a negative build epoch.
+		//nolint:gosec // buildEpoch is validated to be non-negative
+		"build_epoch":   mmdbtype.Uint64(t.buildEpoch),
+		"database_type": mmdbtype.String(t.databaseType),
+		"description":   description,
+		//nolint:gosec // ipVersion is always 4 or 6
+		"ip_version": mmdbtype.Uint16(t.ipVersion),
+		"languages":  languages,
+		//nolint:gosec // nodeCount is validated above
+		"node_count": mmdbtype.Uint32(t.nodeCount),
+		//nolint:gosec // recordSize is always 24, 28, or 32
+		"record_size": mmdbtype.Uint16(t.recordSize),
 	}
 	return metadata.WriteTo(dw)
 }

@@ -3,6 +3,7 @@ package mmdbtype
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
@@ -11,8 +12,40 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestMapLargeKeyCount exercises the heap-allocated fallback path in
+// Map.WriteTo for maps with more keys than fit in the stack-allocated
+// sort buffer. It pins down the load-bearing property that the
+// optimization could break (deterministic, sorted output) without
+// coupling the test to every byte of the encoding.
+func TestMapLargeKeyCount(t *testing.T) {
+	const n = 20
+	m := Map{}
+	for i := range n {
+		m[String(fmt.Sprintf("k%02d", i))] = Uint16(uint16(i))
+	}
+
+	buf1 := &bytes.Buffer{}
+	buf2 := &bytes.Buffer{}
+	_, err := m.WriteTo(&dataWriter{Buffer: buf1})
+	require.NoError(t, err)
+	_, err = m.WriteTo(&dataWriter{Buffer: buf2})
+	require.NoError(t, err)
+
+	// Determinism: map iteration order is randomized, so two encodings
+	// matching byte-for-byte proves sort.Strings ran.
+	assert.Equal(t, buf1.Bytes(), buf2.Bytes(), "Map encoding must be deterministic")
+
+	// Control byte: top 3 bits = map type (7), low 5 bits = size for
+	// size < 29. 20 = 10100b, so the first byte is 11110100 = 0xf4.
+	require.Equal(t, byte(0xf4), buf1.Bytes()[0], "control byte must encode %d-entry map", n)
+
+	// The first sorted key is "k00", a length-3 String:
+	// String type (010) + size 3 = 01000011 = 0x43, then "k00".
+	assert.Equal(t, []byte{0x43, 'k', '0', '0'}, buf1.Bytes()[1:5], "first sorted key must be k00")
+}
+
 // The tests in this file were mostly taken from
-// https://github.com/oschwald/maxminddb-golang/blob/master/decoder_test.go
+// https://github.com/oschwald/maxminddb-golang/blob/main/internal/decoder/decoder_test.go
 
 func TestBool(t *testing.T) {
 	bools := map[string]DataType{
@@ -119,9 +152,15 @@ func makeTestStrings() map[string]DataType {
 		"40":       String(""),
 		"4131":     String("1"),
 		"43e4baba": String("人"),
-		"5b313233343536373839303132333435363738393031323334353637":       String("123456789012345678901234567"),
-		"5c31323334353637383930313233343536373839303132333435363738":     String("1234567890123456789012345678"),
-		"5d003132333435363738393031323334353637383930313233343536373839": String("12345678901234567890123456789"),
+		"5b313233343536373839303132333435363738393031323334353637": String(
+			"123456789012345678901234567",
+		),
+		"5c31323334353637383930313233343536373839303132333435363738": String(
+			"1234567890123456789012345678",
+		),
+		"5d003132333435363738393031323334353637383930313233343536373839": String(
+			"12345678901234567890123456789",
+		),
 		"5d01313233343536373839303132333435363738393031323334353637383930": String(
 			"123456789012345678901234567890"),
 	}
@@ -139,7 +178,7 @@ func TestString(t *testing.T) {
 }
 
 func TestByte(t *testing.T) {
-	b := make(map[string]DataType)
+	b := map[string]DataType{}
 	for key, val := range testStrings {
 		oldCtrl, err := hex.DecodeString(key[0:2])
 		require.NoError(t, err)
@@ -177,17 +216,17 @@ func TestUint32(t *testing.T) {
 
 func TestUint64(t *testing.T) {
 	ctrlByte := "02"
-	bits := uint64(64)
+	bits := 64
 
 	uints := map[string]DataType{
 		"00" + ctrlByte:          Uint64(0),
 		"02" + ctrlByte + "01f4": Uint64(500),
 		"02" + ctrlByte + "2a78": Uint64(10872),
 	}
-	for i := uint64(0); i <= bits/8; i++ {
+	for i := 0; i <= bits/8; i++ {
 		expected := uint64((1 << (8 * i)) - 1)
 
-		input := hex.EncodeToString([]byte{byte(i)}) + ctrlByte + strings.Repeat("ff", int(i))
+		input := hex.EncodeToString([]byte{byte(i)}) + ctrlByte + strings.Repeat("ff", i)
 		uints[input] = Uint64(expected)
 	}
 
@@ -196,17 +235,18 @@ func TestUint64(t *testing.T) {
 
 func TestUint128(t *testing.T) {
 	ctrlByte := "03"
-	bits := uint(128)
+	bits := 128
 
 	uints := map[string]DataType{
 		"00" + ctrlByte:          (*Uint128)(big.NewInt(0)),
 		"02" + ctrlByte + "01f4": (*Uint128)(big.NewInt(500)),
 		"02" + ctrlByte + "2a78": (*Uint128)(big.NewInt(10872)),
 	}
-	for i := uint(1); i <= bits/8; i++ {
-		expected := powBigInt(big.NewInt(2), 8*i)
+	for i := 1; i <= bits/8; i++ {
+		expected := &big.Int{}
+		expected.Lsh(big.NewInt(1), 8*uint(i))
 		expected = expected.Sub(expected, big.NewInt(1))
-		input := hex.EncodeToString([]byte{byte(i)}) + ctrlByte + strings.Repeat("ff", int(i))
+		input := hex.EncodeToString([]byte{byte(i)}) + ctrlByte + strings.Repeat("ff", i)
 
 		uints[input] = (*Uint128)(expected)
 	}
@@ -440,17 +480,9 @@ func TestEqual(t *testing.T) {
 	}
 }
 
-// No pow or bit shifting for big int, apparently :-(
-// This is _not_ meant to be a comprehensive power function.
-func powBigInt(bi *big.Int, pow uint) *big.Int {
-	newInt := big.NewInt(1)
-	for i := uint(0); i < pow; i++ {
-		newInt.Mul(newInt, bi)
-	}
-	return newInt
-}
-
 func validateEncoding(t *testing.T, tests map[string]DataType) {
+	t.Helper()
+
 	for expected, dt := range tests {
 		w := &dataWriter{Buffer: &bytes.Buffer{}}
 

@@ -2,6 +2,8 @@ package mmdbwriter
 
 import (
 	"bytes"
+	"fmt"
+	"math"
 
 	"github.com/maxmind/mmdbwriter/mmdbtype"
 )
@@ -13,6 +15,7 @@ type writtenType struct {
 
 type dataWriter struct {
 	*bytes.Buffer
+
 	dataMap     *dataMap
 	offsets     map[dataMapKey]writtenType
 	keyWriter   *keyWriter
@@ -41,6 +44,11 @@ func (dw *dataWriter) maybeWrite(value *dataMapValue) (int, error) {
 		return 0, err
 	}
 
+	if offset > math.MaxUint32 {
+		return 0, fmt.Errorf("offset of %d exceeds maximum when writing data", offset)
+	}
+
+	//nolint:gosec // we check for overflow above
 	written = writtenType{
 		pointer: mmdbtype.Pointer(offset),
 		size:    size,
@@ -52,7 +60,7 @@ func (dw *dataWriter) maybeWrite(value *dataMapValue) (int, error) {
 }
 
 func (dw *dataWriter) WriteOrWritePointer(t mmdbtype.DataType) (int64, error) {
-	keyBytes, err := dw.keyWriter.key(t)
+	keyBytes, err := dw.keyWriter.Key(t)
 	if err != nil {
 		return 0, err
 	}
@@ -84,6 +92,11 @@ func (dw *dataWriter) WriteOrWritePointer(t mmdbtype.DataType) (int64, error) {
 		return size, err
 	}
 
+	if offset > math.MaxUint32 {
+		return 0, fmt.Errorf("offset of %d exceeds maximum when writing data", offset)
+	}
+
+	//nolint:gosec // we check for overflow above
 	dw.offsets[key] = writtenType{
 		pointer: mmdbtype.Pointer(offset),
 		size:    size,

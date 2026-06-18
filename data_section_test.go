@@ -3,9 +3,10 @@ package mmdbwriter
 import (
 	"testing"
 
-	"github.com/maxmind/mmdbwriter/mmdbtype"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/maxmind/mmdbwriter/mmdbtype"
 )
 
 func TestDisablingPointers(t *testing.T) {
@@ -15,7 +16,7 @@ func TestDisablingPointers(t *testing.T) {
 		mmdbtype.String("a repeated string"),
 		mmdbtype.String("a repeated string"),
 	}
-	dm := newDataMap()
+	dm := newDataMap(newKeyWriter())
 
 	key, err := dm.store(v)
 	require.NoError(t, err)
